@@ -1,0 +1,15 @@
+{
+  "name": "openclaw-proxy-hotfix",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "openclaw-proxy-hotfix": "bin/openclaw-proxy-hotfix.mjs"
+  },
+  "scripts": {
+    "test": "node test/run-fixture-tests.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
