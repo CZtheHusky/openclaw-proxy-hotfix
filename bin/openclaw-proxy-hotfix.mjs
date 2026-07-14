@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -93,10 +93,7 @@ function resolvePackageRoot() {
   const override = process.env.OPENCLAW_HOTFIX_PACKAGE_ROOT?.trim();
   if (override) return path.resolve(expandHome(override));
 
-  const binPath = execFileSync("bash", ["-lc", "command -v openclaw"], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
-  }).trim();
+  const binPath = findExecutableOnPath("openclaw");
   if (!binPath) throw new Error("openclaw not found on PATH");
 
   const candidates = [];
@@ -119,6 +116,18 @@ function resolvePackageRoot() {
   throw new Error(`could not resolve OpenClaw package root from ${binPath}`);
 }
 
+function findExecutableOnPath(name) {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {}
+  }
+  return "";
+}
+
 function findPatchFiles(distDir) {
   const jsFiles = walk(distDir).filter((file) => file.endsWith(".js"));
   const oauth = findOne(jsFiles, (file, text) => (
@@ -134,7 +143,12 @@ function findPatchFiles(distDir) {
     text.includes("function createIsolatedCodexAppServerClient") &&
     text.includes("account/chatgptAuthTokens/refresh")
   ), "Codex app-server shared client");
-  return { oauth, policy, shared };
+  const runAttempt = findOne(jsFiles, (file, text) => (
+    text.includes("async function startCodexAttemptThread") &&
+    text.includes("startupClient = await params.attemptClientFactory({") &&
+    text.includes("const startupAuthProfileId = params.authProfileStore")
+  ), "Codex app-server run attempt");
+  return { oauth, policy, shared, runAttempt };
 }
 
 function findOne(files, predicate, label) {
@@ -151,7 +165,7 @@ function checkAll(ctx) {
   return {
     [PATCH_NAMES.oauth]: checkOAuth(ctx.files.oauth),
     [PATCH_NAMES.policy]: checkPolicy(ctx.files.policy),
-    [PATCH_NAMES.shared]: checkShared(ctx.files.shared)
+    [PATCH_NAMES.shared]: checkShared(ctx.files.shared, ctx.files.runAttempt)
   };
 }
 
@@ -159,7 +173,8 @@ function printCheck(checks, ctx) {
   console.log(`OpenClaw: ${ctx.version}`);
   console.log(`Package:  ${ctx.packageRoot}`);
   for (const [name, result] of Object.entries(checks)) {
-    console.log(`${result.ok ? "ok " : "MISS"} ${name} (${path.relative(ctx.packageRoot, result.file)})`);
+    const files = (result.files ?? [result.file]).map((file) => path.relative(ctx.packageRoot, file)).join(", ");
+    console.log(`${result.ok ? "ok " : "MISS"} ${name} (${files})`);
     if (!result.ok) console.log(`     ${result.reason}`);
   }
   if (!Object.values(checks).every((entry) => entry.ok)) process.exitCode = 2;
@@ -189,17 +204,17 @@ function checkPolicy(file) {
   };
 }
 
-function checkShared(file) {
-  const text = fs.readFileSync(file, "utf8");
-  const acquire = sliceBetween(text, "async function acquireSharedCodexAppServerClient", "async function createIsolatedCodexAppServerClient");
-  const ok = acquire.includes("authProfileStore, startOptions") &&
-    acquire.includes('request.method !== "account/chatgptAuthTokens/refresh"') &&
-    acquire.includes("refreshCodexAppServerAuthTokens({") &&
-    acquire.includes("...authProfileStore ? { authProfileStore } : {}");
+function checkShared(file, runAttemptFile) {
+  const sharedOk = checkSharedText(fs.readFileSync(file, "utf8"));
+  const runAttemptOk = checkRunAttemptText(fs.readFileSync(runAttemptFile, "utf8"));
+  const ok = sharedOk && runAttemptOk;
   return {
     file,
+    files: [file, runAttemptFile],
     ok,
-    reason: ok ? "" : "shared Codex app-server client lacks auth token refresh bridge"
+    reason: ok ? "" : !sharedOk ?
+      "shared Codex app-server client drops the scoped auth profile store" :
+      "Codex run attempt does not carry the scoped auth profile store into the shared client"
   };
 }
 
@@ -208,19 +223,26 @@ function applyAll(ctx) {
   const targets = {
     oauth: ctx.files.oauth,
     policy: ctx.files.policy,
-    shared: ctx.files.shared
+    shared: ctx.files.shared,
+    runAttempt: ctx.files.runAttempt
   };
   const pending = Object.entries(before).filter(([, result]) => !result.ok);
   if (pending.length === 0) return { changed: false, backupDir: null, changedFiles: [] };
 
-  const backupDir = createBackup(ctx, Object.values(targets));
-  const changedFiles = [];
-  for (const key of Object.keys(targets)) {
-    const file = targets[key];
+  const rendered = {};
+  for (const [key, file] of Object.entries(targets)) {
     const oldText = fs.readFileSync(file, "utf8");
     const newText = key === "oauth" ? patchOAuth(oldText, ctx.distDir) :
       key === "policy" ? patchPolicy(oldText) :
-      patchShared(oldText);
+      key === "shared" ? patchShared(oldText) :
+      patchRunAttempt(oldText);
+    if (newText !== oldText) nodeCheckText(newText, file);
+    rendered[key] = { file, oldText, newText };
+  }
+
+  const backupDir = createBackup(ctx, Object.values(targets));
+  const changedFiles = [];
+  for (const { file, oldText, newText } of Object.values(rendered)) {
     if (newText !== oldText) {
       fs.writeFileSync(file, newText);
       changedFiles.push(file);
@@ -320,43 +342,65 @@ function checkPolicyText(text) {
 
 function patchShared(text) {
   if (checkSharedText(text)) return text;
-  const start = text.indexOf("async function acquireSharedCodexAppServerClient");
-  const end = text.indexOf("async function createIsolatedCodexAppServerClient");
+  let next = text.replace(
+    "\t\texisting.context = context;",
+    "\t\texisting.context = context.authProfileStore || !existing.context.authProfileStore ? context : { ...context, authProfileStore: existing.context.authProfileStore };"
+  );
+  const start = next.indexOf("async function acquireSharedCodexAppServerClient");
+  const end = next.indexOf("async function createIsolatedCodexAppServerClient");
   if (start < 0 || end < 0 || end <= start) throw new Error("shared client: acquire/create function boundary not found");
-  let acquire = text.slice(start, end);
+  let acquire = next.slice(start, end);
   acquire = acquire.replace(
     "const { agentDir, usesNativeAuth, authProfileId, startOptions } = await resolveCodexAppServerClientStartContext(options);",
     "const { agentDir, usesNativeAuth, authProfileId, authProfileStore, startOptions } = await resolveCodexAppServerClientStartContext(options);"
   );
   acquire = acquire.replace(
-    "\t\tentry.client = client;\n\t\toptions?.onStartedClient?.(client);",
-    `\t\tentry.client = client;
-\t\tif (authProfileId) client.addRequestHandler(async (request) => {
-\t\t\tif (request.method !== "account/chatgptAuthTokens/refresh") return;
-\t\t\treturn await refreshCodexAppServerAuthTokens({
-\t\t\t\tagentDir,
-\t\t\t\tauthProfileId,
-\t\t\t\t...authProfileStore ? { authProfileStore } : {},
-\t\t\t\tconfig: options?.config
-\t\t\t});
-\t\t});
-\t\toptions?.onStartedClient?.(client);`
+    "\t\t\tauthProfileId: usesNativeAuth ? null : authProfileId,\n\t\t\tconfig: options?.config,",
+    "\t\t\tauthProfileId: usesNativeAuth ? null : authProfileId,\n\t\t\tauthProfileStore,\n\t\t\tconfig: options?.config,"
   );
   acquire = acquire.replace(
-    "\t\t\t\tstartOptions,\n\t\t\t\tconfig: options?.config\n\t\t\t});",
-    "\t\t\t\tstartOptions,\n\t\t\t\tconfig: options?.config,\n\t\t\t\t...authProfileStore ? { authProfileStore } : {}\n\t\t\t});"
+    "\t\t\tauthProfileId: usesNativeAuth ? void 0 : authProfileId,\n\t\t\tconfig: options?.config\n\t\t});",
+    "\t\t\tauthProfileId: usesNativeAuth ? void 0 : authProfileId,\n\t\t\tauthProfileStore,\n\t\t\tconfig: options?.config\n\t\t});"
   );
-  const next = `${text.slice(0, start)}${acquire}${text.slice(end)}`;
-  if (!checkSharedText(next)) throw new Error("shared client: expected acquire client shape was not found");
+  next = `${next.slice(0, start)}${acquire}${next.slice(end)}`;
+  if (!checkSharedText(next)) throw new Error("shared client: expected runtime/acquire client shape was not found");
   return next;
 }
 
 function checkSharedText(text) {
   const acquire = sliceBetween(text, "async function acquireSharedCodexAppServerClient", "async function createIsolatedCodexAppServerClient");
   return acquire.includes("authProfileStore, startOptions") &&
-    acquire.includes('request.method !== "account/chatgptAuthTokens/refresh"') &&
-    acquire.includes("refreshCodexAppServerAuthTokens({") &&
-    acquire.includes("...authProfileStore ? { authProfileStore } : {}");
+    acquire.includes("authProfileId: usesNativeAuth ? null : authProfileId,\n\t\t\tauthProfileStore,\n\t\t\tconfig: options?.config") &&
+    acquire.includes("authProfileId: usesNativeAuth ? void 0 : authProfileId,\n\t\t\tauthProfileStore,\n\t\t\tconfig: options?.config") &&
+    text.includes("function ensureCodexAppServerClientRuntime") &&
+    text.includes("existing.context = context.authProfileStore || !existing.context.authProfileStore ? context : { ...context, authProfileStore: existing.context.authProfileStore };") &&
+    text.includes('request.method !== "account/chatgptAuthTokens/refresh"') &&
+    text.includes("refreshCodexAppServerAuthTokens({");
+}
+
+function patchRunAttempt(text) {
+  if (checkRunAttemptText(text)) return text;
+  let next = text;
+  next = next.replace(
+    /(\n(\t*)authProfileId: params\.startupAuthProfileId,\n)\2agentDir: params\.agentDir,/,
+    "$1$2authProfileStore: params.authProfileStore,\n$2agentDir: params.agentDir,"
+  );
+  next = next.replace(
+    /(\n(\t*)authProfileId: params\.startupAuthProfileId,\n)\2config: params\.config\n/,
+    "$1$2authProfileStore: params.authProfileStore,\n$2config: params.config\n"
+  );
+  next = next.replace(
+    /(\n(\t*)startupEnvApiKeyCacheKey,\n)\2agentDir,/,
+    "$1$2authProfileStore: params.authProfileStore,\n$2agentDir,"
+  );
+  if (!checkRunAttemptText(next)) throw new Error("run attempt: expected shared auth profile store flow was not found");
+  return next;
+}
+
+function checkRunAttemptText(text) {
+  return /authProfileId: params\.startupAuthProfileId,\n\t+authProfileStore: params\.authProfileStore,\n\t+agentDir: params\.agentDir/.test(text) &&
+    /authProfileId: params\.startupAuthProfileId,\n\t+authProfileStore: params\.authProfileStore,\n\t+config: params\.config/.test(text) &&
+    /startupEnvApiKeyCacheKey,\n\t+authProfileStore: params\.authProfileStore,\n\t+agentDir,/.test(text);
 }
 
 function createBackup(ctx, files) {
@@ -483,6 +527,14 @@ function runOpenClaw(args, options = {}) {
 function nodeCheck(file) {
   const child = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" });
   if (child.status !== 0) throw new Error(`node --check failed for ${file}: ${child.stderr || child.stdout}`);
+}
+
+function nodeCheckText(source, file) {
+  const child = spawnSync(process.execPath, ["--check", "--input-type=module"], {
+    encoding: "utf8",
+    input: source
+  });
+  if (child.status !== 0) throw new Error(`node --check failed for patched ${file}: ${child.stderr || child.stdout}`);
 }
 
 function walk(root) {

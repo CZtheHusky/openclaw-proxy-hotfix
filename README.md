@@ -35,7 +35,14 @@ openclaw-proxy-hotfix verify --full
 - `openclaw tui --local`, `openclaw chat`, and `openclaw terminal` start
   OpenClaw's managed proxy when `proxy.enabled=true`.
 - The shared Codex app-server client can refresh ChatGPT auth tokens during
-  long-lived TUI sessions.
+  long-lived TUI sessions without a later shared-client lease discarding the
+  active auth-profile store.
+
+## Compatibility
+
+- Validated against OpenClaw `2026.7.1`.
+- `apply` preflights every target before writing, so an unsupported compiled
+  shape fails without partially patching the installation.
 
 ## Restore
 
